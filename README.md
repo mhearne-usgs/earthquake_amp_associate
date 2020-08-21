@@ -1,2 +1,2 @@
-# earthquake_amp_associate
-Associate earthquake amplitudes with earthquakes
+# shakemap_aws_queue
+ShakeMap Queue database definition and management
