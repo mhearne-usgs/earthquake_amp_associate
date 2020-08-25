@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import (Column, Integer, Float, String,
                         DateTime, ForeignKey, Boolean)
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy_utils import database_exists, create_database
 
@@ -35,6 +35,12 @@ class IncompleteConstructorException(Exception):
     pass
 
 
+def _fk_pragma_on_connect(dbapi_con, con_record):
+    # use of this ensures that foreign key delete cascade
+    # directives will be obeyed, at least in sqlite.
+    dbapi_con.execute('pragma foreign_keys=ON')
+
+
 def get_session(url='sqlite:///:memory:', create_db=True):
     """Get a SQLAlchemy Session instance for input database URL.
     :param url:
@@ -60,6 +66,9 @@ def get_session(url='sqlite:///:memory:', create_db=True):
         connect_args = {'connect_timeout': MYSQL_TIMEOUT}
 
     engine = create_engine(url, echo=False, connect_args=connect_args)
+    if 'sqlite' in url:
+        # make sure that we enable foreign keys when using sqlite
+        event.listen(engine, 'connect', _fk_pragma_on_connect)
     Base.metadata.create_all(engine)
 
     # create a session object that we can use to insert and
@@ -74,184 +83,88 @@ class Event(Base):
     """Class representing the "event" table in the database.
 
     """
-    EVENT = {'eventid': String(64),
-             'netid': String(32),
-             'time': DateTime(),
-             'lat': Float(),
-             'lon': Float(),
-             'depth': Float(),
-             'magnitude': Float(),
-             'locstring': String(1024),
-             }
     __tablename__ = 'event'
-    id = Column(Integer, primary_key=True)
-    eventid = Column(EVENT['eventid'], index=True)
-    netid = Column(EVENT['netid'])
-    time = Column(EVENT['time'])
-    lat = Column(EVENT['lat'])
-    lon = Column(EVENT['lon'])
-    depth = Column(EVENT['depth'])
-    magnitude = Column(EVENT['magnitude'])
-    locstring = Column(EVENT['locstring'])
+    id = Column(Integer(), primary_key=True)
+    eventid = Column(String(64), index=True)
+    netid = Column(String(32))
+    time = Column(DateTime())
+    lat = Column(Float())
+    lon = Column(Float())
+    depth = Column(Float())
+    magnitude = Column(Float())
+    locstring = Column(String(1024))
 
     stations = relationship("Station", back_populates="event",
+                            passive_deletes=True,
                             cascade="all, delete, delete-orphan")
-
-    @property
-    def is_running(self):
-        for queue in self.queued:
-            if queue.is_running:
-                return True
-        return False
 
     @property
     def age_in_days(self):
         return (datetime.utcnow() - self.time) / timedelta(days=1)
-
-    def __init__(self, **kwargs):
-        """Instantiate an Event object from scratch (i.e., not from a query).
-
-        Note: Although keyword arguments, all arguments below must be supplied.
-
-        Args:
-            eventid (str): Event ID of the form "us2020abcd".
-            netid (str): The network code at the beginning of the eventid.
-            time (datetime): Origin time, UTC.
-            lat (float): Origin latitude.
-            lon (float): Origin longitude.
-            depth (float): Origin depth.
-            magnitude (float): Origin magnitude.
-            locstring (str): Description of earthquake location.
-            lastrun (datetime): Set this to something like datetime(1900,1,1).
-
-        Returns:
-            Event: Instance of the Event object.
-        """
-        validate_inputs(self.EVENT, kwargs)
-
-        for key, value in kwargs.items():
-            setattr(self, key, value)
 
     def __repr__(self):
         return (f'Event: {self.eventid}')
 
 
 class Station(Base):
-    STATION = {'event_id': Integer(),
-               'timestamp': DateTime(),
-               'lat': Float(),
-               'lon': Float(),
-               'network': String(32),
-               'name': String(1024),
-               'code': String(32),
-               'loadtime': DateTime(),
-               }
     __tablename__ = 'station'
-    id = Column(Integer, primary_key=True)
-    event_id = Column(STATION['event_id'], ForeignKey('event.id'))
-    timestamp = Column(STATION['timestamp'])
-    lat = Column(STATION['lat'])
-    lon = Column(STATION['lon'])
-    network = Column(STATION['network'], index=True)
-    name = Column(STATION['name'])
-    code = Column(STATION['code'], index=True)
-    loadtime = Column(STATION['loadtime'])
+    id = Column(Integer(), primary_key=True)
+    event_id = Column(Integer(),
+                      ForeignKey('event.id', ondelete='CASCADE'),
+                      nullable=True,
+                      )
+    timestamp = Column(DateTime())
+    lat = Column(Float())
+    lon = Column(Float())
+    network = Column(String(32), index=True)
+    name = Column(String(1024))
+    code = Column(String(32), index=True)
+    loadtime = Column(DateTime())
 
     # a station can have one event
     event = relationship("Event", back_populates='stations')
 
     # a station can have many channels
     channels = relationship('Channel', back_populates='station',
+                            passive_deletes=True,
                             cascade="all, delete, delete-orphan")
-
-    def __init__(self, **kwargs):
-        validate_inputs(self.STATION, kwargs)
-
-        for key, value in kwargs.items():
-            setattr(self, key, value)
 
     def __repr__(self):
         return (f'Station: {self.code}, {self.name}')
 
 
 class Channel(Base):
-    CHANNEL = {'station_id': Integer(),
-               'channel': String(32),
-               'loc': String(1024),
-               }
     __tablename__ = 'channel'
-    id = Column(Integer, primary_key=True)
-    station_id = Column(CHANNEL['station_id'],
-                        ForeignKey('station.id'), index=True)
-    channel = Column(CHANNEL['channel'])
-    loc = Column(CHANNEL['loc'])
+    id = Column(Integer(), primary_key=True)
+    station_id = Column(Integer(),
+                        ForeignKey('station.id', ondelete='CASCADE'),
+                        nullable=True)
+    channel = Column(String(32))
+    loc = Column(String(32))
 
     # a channel has one station that it belongs to
     station = relationship("Station", back_populates='channels')
 
     # a channel has many pgms
     pgms = relationship("PGM", back_populates='channel',
+                        passive_deletes=True,
                         cascade="all, delete, delete-orphan")
-
-    def __init__(self, **kwargs):
-        validate_inputs(self.CHANNEL, kwargs)
-
-        for key, value in kwargs.items():
-            setattr(self, key, value)
 
     def __repr__(self):
         return (f'Channel: {self.channel}')
 
 
 class PGM(Base):
-    PGM = {'channel_id': Integer(),
-           'imt': String(16),
-           'value': Float(),
-           }
     __tablename__ = 'pgm'
-    id = Column(Integer, primary_key=True)
-    channel_id = Column(PGM['channel_id'],
-                        ForeignKey('channel.id'), index=True)
-    imt = Column(PGM['imt'])
-    value = Column(PGM['value'])
+    id = Column(Integer(), primary_key=True)
+    channel_id = Column(Integer(),
+                        ForeignKey('channel.id', ondelete='CASCADE'),
+                        nullable=True)
+    imt = Column(String(16))
+    value = Column(Float())
 
     # a channel has one station that it belongs to
     channel = relationship("Channel", back_populates='pgms')
 
-    def __init__(self, **kwargs):
-        validate_inputs(self.PGM, kwargs)
-
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-
     def __repr__(self):
         return (f'PGM: {self.imt} = {self.value}')
-
-
-def validate_inputs(defdict, kwdict):
-    """Validate all init() inputs against the python types of table columns.
-
-    Args:
-        defdict (dict): Dictionary containing the column
-                        names/SQLAlchemy types.
-        kwdict (dict): Dictionary containing the init() kwargs.
-
-    Raises:
-        IncompleteConstructorException: Not all kwargs are set.
-        IncorrectDataTypesException: At least one of the kwargs is
-                                     of the wrong type.
-    """
-    # first check that all required parameters are being set
-    if not set(defdict.keys()) <= set(kwdict.keys()):
-        msg = ('In Event constructor, all the following values must be set:'
-               f'{str(list(defdict.keys()))}')
-        raise IncompleteConstructorException(msg)
-
-    errors = []
-    for key, value in kwdict.items():
-        ktype = defdict[key].python_type
-        if not isinstance(value, ktype):
-            errors.append(f'{key} must be of type {ktype}')
-    if len(errors):
-        msg = '\n'.join(errors)
-        raise IncorrectDataTypesException(msg)

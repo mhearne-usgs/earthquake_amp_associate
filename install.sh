@@ -81,6 +81,7 @@ package_list=(
       "boto3"
       "ipython"
       "defusedxml"
+      "pymysql"
       "pandas"
       "numpy"
       "pyyaml"

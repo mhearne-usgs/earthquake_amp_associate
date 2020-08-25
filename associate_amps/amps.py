@@ -64,56 +64,6 @@ MAX_EVENT_AGE = 90
 STATION_WINDOW_SECS = 10
 
 
-def get_config():
-    """Return queue config from url indicated by QUEUE_URL env variable.
-
-    Returns:
-        dict: Dictionary containing top level key 'queue', which contains:
-              - max_process_time: Number of seconds allowed for ShakeMaps
-                to complete processing.
-              - max_running: Total number of ShakeMap instances to run
-                simultaneously.
-              - old_event_age: Seconds past which old events will be ignored.
-              - future_event_age: Seconds beyond which events in the future
-                will be ignored.
-              - minmag: Default global magnitude threshold.
-              - max_trigger_wait: Prevents event from being run too often.
-              - polygons: List of dictionaries with fields:
-                          - name: Name of polygon
-                          - magnitude: Magnitude threshold for polygon
-                          - polygon: Sequence of (X,Y) tuples.
-              - repeats: Dictionary with list of dictionaries containing
-                         fields:
-                         - mag: Minimum magnitude threshold
-                         - times: Sequence of repeat times in seconds.
-              - network_delays: List of dictionaries containing fields:
-                                - network: Code of network.
-                                - delay: Seconds to delay processing of
-                                  origins.
-              - emails: Dictionary containing fields:
-                        - error_emails: List of email addresses to receive
-                          error messages.
-                        - sender: Sender email address.
-
-    """
-    # get the environment variable telling us where our queue config is
-    if QUEUE_URL not in os.environ:
-        msg = (f"Could not find queue config url "
-               f"environment variable {QUEUE_URL}")
-        raise NameError(msg)
-    queue_url = os.environ[QUEUE_URL]
-    try:
-        with urlopen(queue_url) as fh:
-            data = fh.read().decode('utf8')
-
-        io_obj = StringIO(data)
-        config = yaml.safe_load(io_obj)
-
-        return config
-    except Exception as e:
-        raise e
-
-
 def insert_event(eventdict):
     """Attempt to insert an event into the ShakeMap Queue database.
 
@@ -148,8 +98,8 @@ def insert_event(eventdict):
     if eventobj is not None:
         eventobj.eventid = eventdict['eventid']
         eventobj.time = eventdict['time']
-        eventobj.lat = eventdict['latitude']
-        eventobj.lon = eventdict['longitude']
+        eventobj.lat = eventdict['lat']
+        eventobj.lon = eventdict['lon']
         eventobj.depth = eventdict['depth']
         eventobj.magnitude = eventdict['magnitude']
         eventobj.locstring = eventdict['locstring']
@@ -260,15 +210,13 @@ def insert_amps(ampsurl):
     # The station (at this pgmtime +/- 10 seconds) might already exist
     # in the DB; if it does, use it
     #
-    # TODO: what is this in sqlalchemy?
-    # self._cursor.execute('BEGIN EXCLUSIVE')
     minustime = pgmdate - timedelta(seconds=STATION_WINDOW_SECS)
     plustime = pgmdate + timedelta(seconds=STATION_WINDOW_SECS)
     rows = session.query(Station.id, Station.timestamp).\
         filter(Station.network == network).\
         filter(Station.code == code).\
         filter(Station.timestamp > minustime).\
-        filter(Station.timestamp < plustime).all()
+        filter(Station.timestamp < plustime).with_for_update().all()
     #
     # It's possible that the query returned more than one station; pick
     # the one closest to the new station's pgmtime
@@ -282,7 +230,7 @@ def insert_amps(ampsurl):
             best_sid = row[0]
     inserted_station = False
     if best_sid is None:
-        station = Station(event_id=0,
+        station = Station(event_id=None,
                           timestamp=pgmdate,
                           lat=lat,
                           lon=lon,
@@ -381,7 +329,9 @@ def insert_amps(ampsurl):
             # If we didn't insert any amps, but we inserted the channel,
             # delete the channel
             #
-            session.query(Channel).filter(Channel.id == best_cid).delete()
+            channel = session.query(Channel).\
+                filter(Channel.id == best_cid).first()
+            session.delete(channel)
             session.commit()
             channels_inserted -= 1
         # End of pgm loop
@@ -391,12 +341,20 @@ def insert_amps(ampsurl):
     # If we inserted the station but no channels, delete the station
     #
     if channels_inserted == 0 and inserted_station:
-        session.query(Station).filter(Station.id == best_sid).delete()
+        station = session.query(Station).filter(Station.id == best_sid).first()
+        session.delete(station)
         session.commit()
     session.close()
 
 
 def associate_amps():
+    """Attempt to associate amplitudes with appropriate events.
+
+    This routine loops over all events in the database, and uses
+    a simple association algorithm to find peak ground motions that
+    are likely caused by the event.
+
+    """
     if DB_URL not in os.environ:
         raise KeyError(f"Database URL {DB_URL} not in environment.")
     db_url = os.environ[DB_URL]
@@ -410,12 +368,25 @@ def associate_amps():
             write_event_to_s3(event)
         # now delete all of the stations newly
         # associated with the event
-        session.query(Station).filter(Station.event_id == event.id).delete()
+        stations = session.query(Station).\
+            filter(Station.event_id == event.id).all()
+        for station in stations:
+            session.delete(station)
         session.commit()
     session.close()
 
 
 def associate(session, event):
+    """Find peak ground motions likely associated with the event.
+
+    This event can modify the database in the following ways:
+     - Set event_id field of station rows to event.id
+     - Delete station/channel/pgm rows where stations appear to be duplicates.
+
+    Args:
+        session (Session): SQLAlchemy Session object.
+        event (Event): SQLAlchemy Event wrapper.
+    """
     eqtime = event.time
     eqlat = event.lat
     eqlon = event.lon
@@ -428,17 +399,13 @@ def associate(session, event):
                           Station.timestamp,
                           Station.lat,
                           Station.lon,
-                          Channel.channel,
-                          PGM.imt,
-                          PGM.value).with_for_update()
-    query = query.join(Channel, Channel.station_id == Station.id)\
-        .join(PGM, PGM.channel_id == Channel.id)
+                          ).with_for_update()
     query = query.filter(and_(Station.timestamp > stime,
                               Station.timestamp < etime))
 
     srows = query.all()
     cols = ['id', 'network', 'name', 'code', 'timestamp',
-            'lat', 'lon', 'channel', 'imt', 'value']
+            'lat', 'lon']
     stations = pd.DataFrame(srows, columns=cols)
     stations['distance'] = geodetic_distance(eqlon, eqlat,
                                              stations['lon'],
@@ -461,6 +428,18 @@ def associate(session, event):
     inside_distance = stations['inside_distance']
     newstations = stations[inside_time & inside_distance]
 
+    # # keep the duplicate station with the smallest dt
+    keepstations = newstations.sort_values('dt',
+                                           ascending=True).\
+        drop_duplicates(['code'])
+
+    # delete those stations that are duplicates
+    junkids = set(newstations['id']) - set(keepstations['id'])
+    junkstations = session.query(Station).\
+        filter(Station.id.in_(junkids)).all()
+    for junkstation in junkstations:
+        session.delete(junkstation)
+
     in_expression = Station.id.in_(newstations['id'])
     udict = {Station.event_id: event.id}
     session.query(Station).\
@@ -470,21 +449,41 @@ def associate(session, event):
 
 
 def clean_database():
+    """Clear out old peak amplitudes and events from database.
+
+    Returns:
+        tuple: (Number of amplitudes deleted, number of events deleted).
+
+    """
     if DB_URL not in os.environ:
         raise KeyError(f"Database URL {DB_URL} not in environment.")
     db_url = os.environ[DB_URL]
     session = get_session(db_url)
 
-    # delete old amps
     amp_threshold = datetime.utcnow() - timedelta(days=MAX_AMP_AGE)
-    session.query(Station).filter(Station.loadtime < amp_threshold).delete()
+    event_threshold = datetime.utcnow() - timedelta(days=MAX_EVENT_AGE)
+
+    namps = session.query(Station).\
+        filter(Station.loadtime < amp_threshold).count()
+    nevents = session.query(Event).\
+        filter(Event.time < event_threshold).count()
+
+    # delete old amps
+    amps = session.query(Station).\
+        filter(Station.loadtime < amp_threshold).all()
+    for amp in amps:
+        session.delete(amp)
+        session.commit()
 
     # delete old earthquakes
-    event_threshold = datetime.utcnow() - timedelta(days=MAX_EVENT_AGE)
-    session.query(Event).filter(Event.time < event_threshold).delete()
+    events = session.query(Event).filter(Event.time < event_threshold).all()
+    for event in events:
+        session.delete(event)
 
     # commit changes, and close the session
     session.commit()
+
+    return (namps, nevents)
 
 
 def write_event_to_s3(event):
