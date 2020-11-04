@@ -9,4 +9,13 @@ setup(name='associate_amps',
       packages=[
           'associate_amps',
       ],
+      install_requires=[
+          'pandas',
+          'PyYAML',
+          'boto3',
+          'sqlalchemy',
+          'defusedxml',
+          'numpy',
+      ],
+
       )
